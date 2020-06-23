@@ -1,6 +1,7 @@
 import base64
 import json
 from urllib.parse import urljoin, urlencode
+from django.apps import apps as django_apps
 from django.urls import resolve, reverse
 from django.db import transaction
 from django.conf import settings
@@ -14,9 +15,8 @@ from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework.exceptions import ValidationError
 from online_payments.payments.simple_v2 import SimplePay, SimplePayEvent
-from online_payments.payments.simple_v2.exceptions import IPNError, SimplePayException
+from online_payments.payments.simple_v2.exceptions import IPNError
 from online_payments.payments.exceptions import InvalidSignature
-
 from appointments.models import Appointment, QRCode
 from appointments.auth import AppointmentAuthentication
 from appointments.permissions import AppointmentPermission
@@ -29,9 +29,6 @@ from . import services
 
 ROUTE_PAYMENT_STATUS = "/fizetes-status"
 ROUTE_PAYMENT_FAILED = "/sikertelen-fizetes"
-
-
-simplepay = SimplePay(settings.SIMPLEPAY_SECRET_KEY, settings.SIMPLEPAY_MERCHANT, settings.SIMPLEPAY_USE_LIVE)
 
 
 class GetPriceView(generics.GenericAPIView):
@@ -122,34 +119,13 @@ class PayAppointmentView(_BasePayView, generics.GenericAPIView):
         if summary["total_price"] != serializer.validated_data["total_price"]:
             raise ValidationError({"total_price": "Invalid amount!"})
 
-        if serializer.validated_data["payment_method"] == PaymentMethodType.SIMPLEPAY:
-            transaction = self._create_transaction(summary["total_price"], summary["currency"])
+        payments_app = django_apps.get_app_config("payments")
 
-            # Order ref must be unique at a transaction level, appointment level is not enough.
-            # When multiple transactions with the same order refs are sent to Simple,
-            # Simple will find the same transaction.
-            # It is even possible to put a transaction from Cancelled to Created state
-            # in Simple's system, by creating and sending a start request with the same order_ref.
-            order_ref = str(transaction.pk)
-            try:
-                res = simplepay.start(
-                    customer_email=appointment.email,
-                    order_ref=order_ref,
-                    total=summary["total_price"],
-                    callback_url=request.build_absolute_uri(reverse("simplepay-back")),
-                )
-            except SimplePayException as error:
-                raise ValidationError({"error": str(error)})
-
-            transaction.status = transaction.STATUS_WAITING_FOR_AUTHORIZATION
-            transaction.external_reference_id = res.transaction_id
-            transaction.save()
-
-            for payment in payments:
-                payment.simplepay_transactions.add(transaction)
-
-            return Response({"simplepay_form_url": res.payment_url})
-
+        if serializer.validated_data["payment_method"] == payments_app.service.payment_method_type:
+            callback_url = request.build_absolute_uri(reverse("simplepay-back"))
+            return payments_app.service.handle_payment(
+                payments, summary["total_price"], summary["currency"], appointment.email, callback_url
+            )
         else:
             self._complete_registration(appointment, payments)
             return Response(summary)
@@ -186,41 +162,3 @@ class PaymentStatusView(generics.GenericAPIView):
         elif last_transaction.status == last_transaction.STATUS_WAITING_FOR_AUTHORIZATION:
             payment_status = "PENDING"
         return Response({"payment_status": payment_status})
-
-
-@api_view(["POST"])
-def simplepay_ipn_view(request):
-    try:
-        ipn, response = simplepay.process_ipn_request(request)
-    except (InvalidSignature, IPNError):
-        raise ValidationError({"error": _("SimplePay error")})
-
-    transaction = m.SimplePayTransaction.objects.get(external_reference_id=ipn.transaction_id)
-    if ipn.status == "FINISHED":
-        services.complete_transaction(transaction, ipn.finish_date)
-
-    return Response(response["body"], headers=response["headers"])
-
-
-@api_view(["GET"])
-def simplepay_back_view(request):
-    """docs: PaymentService v2 - 3.11 back url"""
-
-    expected_signature = request.GET["s"]
-    r_params_json = base64.b64decode(request.GET["r"].encode())
-    simplepay.validate_signature(expected_signature, r_params_json.decode())
-
-    r_params = json.loads(r_params_json)
-    event = SimplePayEvent(r_params["e"])
-    if event is SimplePayEvent.SUCCESS:
-        frontend_path = ROUTE_PAYMENT_STATUS
-    else:
-        frontend_path = ROUTE_PAYMENT_FAILED
-
-    frontend_full_url = urljoin(settings.FRONTEND_URL, frontend_path)
-
-    transaction_params = {
-        "simplepay_transaction_id": r_params["t"],
-        "simplepay_transaction_event": event.value,
-    }
-    return redirect(f"{frontend_full_url}?{urlencode(transaction_params)}")
